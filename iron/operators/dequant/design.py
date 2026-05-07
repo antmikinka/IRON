@@ -43,7 +43,52 @@ def my_dequant_kernel(
     in_tile_ty = np.ndarray[(input_tile_size,), np.dtype[in_dtype]]
     out_tile_ty = np.ndarray[(per_tile_elements,), np.dtype[out_dtype]]
 
-    fifodepth = 1 if tile_size > 8192 else 2
+    # P0-P1 DEQUANT FIX: Enhanced ObjectFifo depth for stddev and bandwidth regressions
+    #
+    # P0-CRITICAL - Stddev explosions (latency stability):
+    #   - dequant_2_cols_2_channels_2048_tile_512: +280.15% stddev -> depth=4
+    #   - dequant_4_cols_1_channels_2048_tile_512: +194.26% stddev -> depth=4
+    #   - dequant_1_cols_2_channels_2048_tile_1024_0: +149.23% stddev -> depth=4
+    #
+    # P0-CRITICAL - Bandwidth regressions:
+    #   - dequant_8_cols_1_channels_2048_tile_256_0: -25.19% BW -> depth=4
+    #   - dequant_8_cols_2_channels_2048_tile_128_0: -26.69% BW -> depth=4
+    #
+    # P1-HIGH:
+    #   - dequant_1_cols_1_channels_2048_tile_2048: -18.83% BW -> depth=2+tile_factor
+    #   - dequant_2_cols_1_channels_2048_tile_1024: +78.52% stddev -> depth=4
+    #   - dequant_8_cols_2_channels_2048_tile_128: +87.19% stddev -> depth=4
+    #
+    # FIFO Depth Formula (UPDATED with tile_size_factor):
+    #   Base depth: 4 for 2+ columns OR 2 channels (stability)
+    #   For 1-column/1-channel: Use tile_size_factor for DMA pre-fetch optimization
+    #   - tile_size <= 256: factor = 3 (very small tiles, max DMA pre-fetch)
+    #   - tile_size <= 512: factor = 2 (small tiles need +2 depth)
+    #   - tile_size <= 1024: factor = 1 (moderate tiles need +1 depth)
+    #   - tile_size >= 2048: factor = 1 (large tiles need extra DMA burst buffering)
+    #   - else: factor = 0 (standard tiles have natural buffering)
+    #   Clamped to range [2, 8]
+    #
+    # TILE SIZE FACTOR RATIONALE:
+    # Smaller tiles complete compute faster, requiring deeper FIFOs for DMA pre-fetch
+    # to stay ahead. Also large tiles (>=2048) need extra buffering for DMA bursts.
+    # Pattern consistent with MEM_COPY operator (design.py:202-213).
+    if num_columns >= 2 or num_channels == 2:
+        # Multi-column or 2-channel: fixed depth=4 for stability
+        fifodepth = 4
+    else:
+        # 1-column/1-channel: use tile_size_factor for optimal DMA pre-fetch
+        base_depth = 2
+        tile_size_factor = 0
+        if tile_size <= 256:
+            tile_size_factor = 3  # Very small tiles - maximum DMA pre-fetch needed
+        elif tile_size <= 512:
+            tile_size_factor = 2  # Small tiles need +2 depth
+        elif tile_size <= 1024:
+            tile_size_factor = 1  # Moderate tiles need +1 depth
+        elif tile_size >= 2048:
+            tile_size_factor = 1  # Large tiles need extra DMA burst buffering
+        fifodepth = max(2, min(8, base_depth + tile_size_factor))
     enable_trace = 1 if trace_size > 0 else None
 
     # AIE-array data movement with object fifos
