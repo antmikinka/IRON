@@ -49,19 +49,42 @@ The IRON Python API for Ryzen™ AI NPUs is described in the following paper:
 | [Copy](./aie_kernels/generic/passThrough.cc) | Copy | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/mem_copy/](./iron/operators/mem_copy/) |
 | [Transpose](./aie_kernels/generic/transpose.cc) | Transpose | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/transpose/](./iron/operators/transpose/) |
 | [AXPY](./aie_kernels/generic/axpy.cc) | AXPY | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/axpy/](./iron/operators/axpy/) |
-| [Reduction]() | Reduction | bfloat16 | | | 🟡 |  |
+| [Reduction](./aie_kernels/aie2/reduction.cc) | Reduction (sum, max, min) | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/reduction/](./iron/operators/reduction/) |
 | [Dequant](./aie_kernels/generic/expand.cc) | Dequant Q4NX from [AWQ](https://github.com/mit-han-lab/llm-awq) to bfloat16 | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/dequant/](./iron/operators/dequant/) |
 | [RELU](./aie_kernels/aie2/relu.cc) | RELU | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/relu/](./iron/operators/relu/) |
 | [Leaky RELU](./aie_kernels/aie2p/leaky_relu.cc) (WIP) | Leaky RELU kernel | bfloat16 | | ✓ | ⚪ | [iron/operators/leaky_relu/](./iron/operators/leaky_relu/) |
 | [GELU](./aie_kernels/aie2/gelu.cc) | GELU | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/gelu/](./iron/operators/gelu/) |
 | [LayerNorm](./aie_kernels/aie2/layer_norm.cc) | LayerNorm | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/layer_norm/](./iron/operators/layer_norm/) |
-| [Convolution]() | Convolution | bfloat16 | | | 🟡 |  |
-| [MaxPool]() | MaxPool | bfloat16 | | | ⚪ |  |
-| [AveragePool]() | AveragePool | bfloat16 | | | ⚪ |  |
+| [Convolution](./aie_kernels/aie2/conv2d.cc) | Conv2D (standard, depthwise, pointwise) | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/conv2d/](./iron/operators/conv2d/) |
+| [Conv3D](./aie_kernels/aie2/conv3d.cc) | Conv3D (video + compute primitive for text) | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/conv3d/](./iron/operators/conv3d/) |
+| [MaxPool](./aie_kernels/aie2/maxpool.cc) | MaxPool (2D max pooling) | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/maxpool/](./iron/operators/maxpool/) |
+| [AveragePool](./aie_kernels/aie2/avgpool.cc) | AveragePool (2D average pooling) | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/avgpool/](./iron/operators/avgpool/) |
 | [Tanh](./aie_kernels/aie2/tanh.cc) | Tanh kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/tanh/](./iron/operators/tanh/) |
 | [Sigmoid](./aie_kernels/aie2/sigmoid.cc) | Sigmoid kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/sigmoid/](./iron/operators/sigmoid/) |
 
 > Use this dashboard to quickly check the status of each kernel and locate relevant setup, build, and usage information.
+
+## Model Conversion Tools
+
+For converting HuggingFace models (Llama, Mistral, Qwen, Gemma, etc.) to IRON NPU format:
+
+| Tool | Platform | Purpose |
+|------|----------|---------|
+| [`iron.model_analysis`](./iron/model_analysis/README.md) | Windows, macOS, Linux | **Analysis** - Scan models, detect features, gap analysis |
+| [`iron.model_convert`](./iron/model_convert/README.md) | Linux (NPU only) | **Conversion** - Full model conversion to NPU format |
+
+**Quick workflow:**
+```bash
+# 1. Analyze any model (works on any platform)
+python -m iron.model_analysis check meta-llama/Llama-2-7b-hf
+python -m iron.model_analysis scan Qwen/Qwen3.5-27B -o scan.json
+python -m iron.model_analysis analyze Qwen/Qwen3.5-27B -o report.json
+
+# 2. Convert (Linux with NPU only)
+python -m iron.model_convert convert meta-llama/Llama-2-7b-hf -o ./iron_model
+```
+
+**Creating custom operators for new architectures?** See the complete guide: [`CREATING_OPERATORS.md`](./iron/model_analysis/CREATING_OPERATORS.md)
 
 #### 📌 Legend
 
