@@ -13,7 +13,12 @@ from .leaky_relu.op import AIELeakyReLU
 from .mem_copy.op import AIEMemCopy
 from .mha.op import AIEMHA
 from .relu.op import AIEReLU
+from .reduction.op import AIEReduction
 from .rms_norm.op import AIERMSNorm
+from .conv2d.op import AIEConv2d
+from .conv3d.op import AIEConv3d
+from .maxpool.op import AIEMaxPool2d
+from .avgpool.op import AIEAveragePool2d
 from .rope.op import AIERope
 from .sigmoid.op import AIESigmoid
 from .silu.op import AIESiLU
