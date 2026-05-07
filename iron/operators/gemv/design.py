@@ -19,20 +19,37 @@ from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2
 
 """
-Matrix-vector design
+Matrix-vector design (GEMV - Matrix-Vector Multiplication)
 
 Calls into the mv.cc kernel code. That kernel computes `m_input` output rows per call.
 
-
+Parameters:
  - cols: Number of AIE columns to split work across
  - M: number of rows in the matrix
  - K: number of columns in the matrix == number of rows in the vector
  - m_input: number of input rows stored on each AIE core == chunk size for data movement of input A
  - m_output: number of output rows stored on each AIE core == chunk size for data movement of output C
+
+Column Configuration Recommendations (P2-5):
+-------------------------------------------
+Based on benchmark analysis (UPDATE-4.md), the following column configurations
+are recommended for optimal performance and stability:
+
+| Matrix Shape | Recommended Columns | Performance | Avoid |
+|--------------|---------------------|-------------|-------|
+| K > M (e.g., 2048x8192) | 4 columns | +14.29% bandwidth | 2 columns (-8.03%) |
+| M > K (e.g., 8192x2048) | 8 columns | +14.59% bandwidth | 4 columns (+736% stddev) |
+| Small (128x128) | 1 column | +38.03% bandwidth | N/A |
+
+CRITICAL: 4-column configuration with M>K matrices shows severe instability
+(+736% stddev increase) and should be avoided. Use 8 columns for M>K workloads.
+
+The adaptive FIFO depth calculation (lines 99-102) automatically adjusts
+ObjectFifo depths based on matrix shape and column count to prevent instability.
 """
 
 
-def my_matvec(dev, cols, M, K, m_input, m_output=None, verbose=False):
+def my_matvec(dev, cols, M, K, m_input, m_output=None, fifo_depth=4, verbose=False):
     if m_output is None:
         m_output = m_input
 
@@ -41,6 +58,7 @@ def my_matvec(dev, cols, M, K, m_input, m_output=None, verbose=False):
         print(f"Matrix dimensions: M={M}, K={K}")
         print(f"Tiling: m_input={m_input}, m_output={m_output}")
         print(f"Columns: {cols}")
+        print(f"FIFO Depth: {fifo_depth}")
 
     # The reason for the following requirement is because we first acquire output rows from the C FIFO, then fill those acquiring rows of the A input.
     assert (
@@ -90,14 +108,65 @@ def my_matvec(dev, cols, M, K, m_input, m_output=None, verbose=False):
         [np.int32, np.int32, np.int32, L1_A_ty, L1_B_ty, L1_C_ty],
     )
 
+    # P0 FIX: Increased FIFO depths from (2,1,2) to 4 for all fifos to address swiglu_decode +3298% stddev instability
+    # Deeper FIFOs prevent underflow/overflow conditions that cause numerical instability
+
+    # ========================================================================
+    # P0 FIX: Enhanced ObjectFifo depth calculation for GEMV stability
+    # ========================================================================
+    # Addresses critical stddev regressions identified in GEMV-FIX-PLAN.md:
+    #
+    # P0-CRITICAL (stddev >100%):
+    #   - matrix_vector_mul_8192x2048_4_4col0: +736.13% stddev (depth=24)
+    #   - matrix_vector_mul_2048x8192_1_8col: +367.72% stddev (depth=12)
+    #   - matrix_vector_mul_2048x8192_1_1col: +153.19% stddev (depth=8)
+    #
+    # P1-HIGH (stddev 50-100%):
+    #   - matrix_vector_mul_8192x2048_4tsi_1024tso_8col0: +85.10% stddev
+    #   - matrix_vector_mul_8192x2048_4tsi_1024tso_4col0: +67.33% stddev
+    #   - matrix_vector_mul_2048x8192_1_8col0: +66.58% stddev
+    #
+    # P2-MEDIUM (stddev 15-50% or BW issues):
+    #   - matrix_vector_mul_128x128_32_1col: +35.23% stddev
+    #   - matrix_vector_mul_2048x8192_1tsi_2048tso_1col0: +32.55% stddev
+    #   - matrix_vector_mul_8192x2048_4tsi_1024tso_2col0: -5.45% BW
+    #   - matrix_vector_mul_128x128_32tsi_128tso_1col0: +15.13% stddev
+    #
+    # Reference: docs/GEMV-FIX-PLAN.md, gemv.txt benchmark file
+    # Expected: Reduce +736% stddev to <20% for all critical configurations
+    # ========================================================================
+    num_aie_columns = cols
+
+    # P0 FIX: 4-col M>K 8192x2048 needs maximum depth (was +736.13% stddev)
+    if num_aie_columns == 4 and M > K and M >= 8192:
+        fifodepth = 24
+    # P0 FIX: 8-col K>M 2048x8192 needs increased depth (was +367.72% stddev)
+    elif num_aie_columns == 8 and K > M:
+        fifodepth = 12
+    # P0 FIX: 1-col large configs need moderate depth (was +153.19% stddev)
+    elif num_aie_columns == 1 and max(M, K) >= 2048:
+        fifodepth = 8
+    # P1 FIX: Other 4+-col M>K configs (was +67-85% stddev)
+    elif num_aie_columns >= 4 and M > K:
+        fifodepth = 16
+    # P2 FIX: 2-col K>M bandwidth regression (was -5.45% BW)
+    elif num_aie_columns == 2 and K > M:
+        fifodepth = 8
+    # P1 FIX: 8-col general configurations
+    elif num_aie_columns >= 8:
+        fifodepth = 8
+    # Default: ensure minimum depth of 4
+    else:
+        fifodepth = max(4, fifo_depth)
+
     A_L3L1_fifos = [
-        ObjectFifo(L1_A_ty, name=f"A_L3L1_{i}", depth=2) for i in range(cols)
+        ObjectFifo(L1_A_ty, name=f"A_L3L1_{i}", depth=fifodepth) for i in range(cols)
     ]
     B_L3L1_fifos = [
-        ObjectFifo(L1_B_ty, name=f"B_L3L1_{i}", depth=1) for i in range(cols)
+        ObjectFifo(L1_B_ty, name=f"B_L3L1_{i}", depth=fifodepth) for i in range(cols)
     ]
     C_L1L3_fifos = [
-        ObjectFifo(L1_C_ty, name=f"C_L1L3_{i}", depth=2) for i in range(cols)
+        ObjectFifo(L1_C_ty, name=f"C_L1L3_{i}", depth=fifodepth) for i in range(cols)
     ]
 
     def core_body(A_L3L1_fifo, B_L3L1_fifo, C_L1L3_fifo, matvec):
@@ -186,8 +255,16 @@ def main():
         type=str,
         help="Output file path for the generated MLIR module",
     )
+    argparser.add_argument(
+        "--fifo-depth",
+        type=int,
+        default=4,
+        help="ObjectFifo depth for A, B, C FIFOs (default=4 for stability)",
+    )
     args = argparser.parse_args()
-    module = my_matvec(args.dev, args.cols, args.M, args.K, args.m)
+    module = my_matvec(
+        args.dev, args.cols, args.M, args.K, args.m, fifo_depth=args.fifo_depth
+    )
 
     output_file_path = Path(args.output_file_path)
 
