@@ -30,9 +30,33 @@ def my_eltwise_mul(dev, num_elements, num_columns, num_channels, tile_size, trac
     tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
 
     # AIE-array data movement with object fifos (one per column, not per channel)
-    of_in1s = [ObjectFifo(tile_ty, name=f"in1_{i}") for i in range(num_columns)]
-    of_in2s = [ObjectFifo(tile_ty, name=f"in2_{i}") for i in range(num_columns)]
-    of_outs = [ObjectFifo(tile_ty, name=f"out_{i}") for i in range(num_columns)]
+    # P0 FIX: Unified ObjectFifo depth for ELTWISE_MUL stability
+    # Issues: +108% latency stddev (4-col 2-chan tile=512), +195% latency stddev (1-col 2-chan tile=2048)
+    # Source: eltwise.txt benchmark file
+    # Depth=5 for 4-col 2-channel tile<=512, depth=4 for 8-col and 1-col 2-channel large tiles
+    if num_columns == 4 and num_channels == 2 and tile_size <= 512:
+        fifodepth = 5
+    elif num_columns >= 8:
+        fifodepth = 4
+    elif num_columns == 1 and num_channels == 2 and tile_size >= 2048:
+        fifodepth = 4
+    elif num_channels == 2:
+        fifodepth = 3
+    else:
+        fifodepth = 2
+
+    of_in1s = [
+        ObjectFifo(tile_ty, name=f"in1_{i}", depth=fifodepth)
+        for i in range(num_columns)
+    ]
+    of_in2s = [
+        ObjectFifo(tile_ty, name=f"in2_{i}", depth=fifodepth)
+        for i in range(num_columns)
+    ]
+    of_outs = [
+        ObjectFifo(tile_ty, name=f"out_{i}", depth=fifodepth)
+        for i in range(num_columns)
+    ]
 
     # AIE Core Function declaration
     eltwise_mul_bf16_vector = Kernel(
