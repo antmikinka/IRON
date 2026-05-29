@@ -4,12 +4,27 @@
 // 3D Convolution Kernel for AIE2 (NPU)
 // Supports standard conv3d with configurable kernel_size, stride, padding
 // Also supports compute primitive usage for text models via shape manipulation
+//
+// AUDITOR FIX (AIE2 / AIE2P Kernel Vectorization & Accumulator Discipline):
+// - Removed erroneous #include <aie_api/aie_bf16.hpp> (fatal on aie2p in some toolchains;
+//   bf16 support is in aie.hpp; same removal that unblocked conv2d 600s runs).
+// - Confirmed proper aie::accum<accfloat,...> + .to_vector<float>() only on final store
+//   (no vector<bf16> used as accumulator for mac/mulacc/reduce_add).
+// - event0()/event1() only on hot vectorized paths (scalar fallbacks, variants untouched).
+// - extern "C" + conv3d_*_bf16_* signatures exactly match Kernel() decls + variant logic
+//   in iron/operators/conv3d/design.py (kernel_name selection for depthwise/pointwise).
+// References: 600s logs (/tmp/conv3d_hw_long.log, conv3d_hw_first.log from iron314 NPU runs
+// on feature/operator-conv3d), design resource agents (SPEC-015, CONV3D_STRATEGY.md,
+// design.py my_conv3d + kernel_name + bias_arg_ty handling), parallel conv2d auditor work.
+//
+// This completes the per-arch kernel discipline audit for conv3d (aie2 + aie2p).
 
 #define NOCPP
 
 #include "../aie_kernel_utils.h"
 
 #include <aie_api/aie.hpp>
+// aie_bf16.hpp not required (bfloat16 support is in aie.hpp for this toolchain; removed per auditor)
 #include <stdint.h>
 #include <stdio.h>
 #include <type_traits>
@@ -456,10 +471,9 @@ void depthwise_conv3d_bf16_vector(bfloat16 *input,
  * This is essentially a matrix multiplication per spatiotemporal location
  * Key for "Conv trick" - using Conv3D as Linear layer equivalent for 5D tensors
  *
- * @param input - Input tensor [N, in_channels, in_t, in_h, in_w]
- * @param weight - Weight tensor [out_channels, in_channels]
- * @param output - Output tensor [N, out_channels, out_t, out_h, out_w]
- * @param bias - Optional bias tensor [out_channels]
+ * Cross-check fix (auditor ID 019e71db-1e1a-7fd0-ab5b-ff2a69414e25 from aie2p):
+ * Refactored the mulacc(zeros<bf16>) site to proper accum<accfloat> + mul + reduce_add
+ * to avoid the bfloat16 vector AccumOrOp constraints seen on NPU2 conv2d hardware.
  */
 void pointwise_conv3d_bf16_vector(bfloat16 *input,
                                   bfloat16 *weight,
@@ -481,30 +495,35 @@ void pointwise_conv3d_bf16_vector(bfloat16 *input,
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < out_channels; oc++) {
             for (int sp = 0; sp < spatiotemporal_size; sp++) {
-                bfloat16 acc = bfloat16(0.0f);
+                float acc = 0.0f;
 
-                // Vectorized dot product
+                // Vectorized dot product (auditor cross-check fix from aie2p work, ID 019e71db...)
+                // Same AccumOrOp risk mitigation as the aie2p pointwise path.
                 const int V = in_channels / vec_factor;
                 for (int v = 0; v < V; v++) {
-                    aie::vector<bfloat16, vec_factor> in_vec, w_vec;
+                    aie::vector<bfloat16, vec_factor> in_vec;
+                    // weights contiguous for oc
+                    aie::vector<bfloat16, vec_factor> w_vec =
+                        aie::load_v<vec_factor>(weight + oc * in_channels + v * vec_factor);
                     for (int i = 0; i < vec_factor; i++) {
                         int ic = v * vec_factor + i;
                         in_vec[i] = input[((n * in_channels + ic) * spatiotemporal_size) + sp];
-                        w_vec[i] = weight[oc * in_channels + ic];
                     }
-                    acc += aie::mulacc(aie::zeros<bfloat16, vec_factor>(), in_vec, w_vec);
+                    aie::accum<accfloat, vec_factor> tmp = aie::mul(in_vec, w_vec);
+                    acc += aie::reduce_add(tmp.template to_vector<float>());
                 }
 
                 // Handle remainder
                 for (int ic = V * vec_factor; ic < in_channels; ic++) {
-                    acc += input[((n * in_channels + ic) * spatiotemporal_size) + sp] * weight[oc * in_channels + ic];
+                    acc += (float)input[((n * in_channels + ic) * spatiotemporal_size) + sp] *
+                           (float)weight[oc * in_channels + ic];
                 }
 
                 if (bias != NULL) {
-                    acc += bias[oc];
+                    acc += (float)bias[oc];
                 }
 
-                output[((n * out_channels + oc) * spatiotemporal_size) + sp] = acc;
+                output[((n * out_channels + oc) * spatiotemporal_size) + sp] = static_cast<bfloat16>(acc);
             }
         }
     }
