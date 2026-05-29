@@ -31,6 +31,13 @@ Supports two usage patterns:
 # - All old "elem_in as bias_arg" hacks and "NOTE: incomplete" comments
 #   replaced by clear status. MLIR generation now always succeeds with
 #   variant+ bias combinations.
+# - DMA channel + L2 mem resource allocation (post kernel vectorization audit):
+#   FIXED. Root causes were (a) 6D TAP size/stride vectors on rank-2 (1,size)
+#   tensors (over-requested input DMA channels on tile(0,2) for many configs
+#   incl. 3x16/16x16 g=1/16), (b) fifodepth heuristic only applied depth=1 for
+#   nc<2+large (caused "buffers exceeded" + bank alloc fail on tile(0,2) for
+#   16x32 s2 nc=2 large chunks). Minimal fixes: TAPs now 4D (parity with
+#   conv2d), fifodepth generalized on tile_size first. Preserves all variants.
 # =============================================================================
 
 from ml_dtypes import bfloat16
@@ -134,17 +141,22 @@ def my_conv3d(
         (output_chunk if output_chunk > 0 else 1,), np.dtype[dtype]
     ]
 
-    # P2-11 FIX: Explicit ObjectFifo depth calculation for Conv3d stability
-    # Depth=4 for 8+ columns, depth=3 for 4+ columns, depth=2 for 2 columns, depth=1 for large tiles
-    fifodepth = (
-        4
-        if num_columns >= 8
-        else (
-            3
-            if num_columns >= 4
-            else (2 if num_columns >= 2 else (1 if tile_size > 4096 else 2))
+    # P2-11 FIX + resource allocation fix for DMA/mem: ObjectFifo depth heuristic.
+    # Prioritize per-column chunk size (tile_size param from caller, == chunk after //nc):
+    # - large chunks (e.g. 131k elems for 16x32x32 nc=2) force depth=1 to prevent
+    #   double-buffered in_*/w_*/out_*_buff_* from exceeding L2 bank memory on the
+    #   hosting tile (e.g. tile(0,2) "allocated buffers exceeded" + bank-aware/seq fail).
+    # - small chunks allow higher depth (scaled by num_columns) for headroom.
+    # Generalizes the prior nc<2-only special case. Matches patterns in
+    # channeled_unary_design.py and rms_norm etc.
+    if tile_size > 4096:
+        fifodepth = 1
+    else:
+        fifodepth = (
+            4
+            if num_columns >= 8
+            else (3 if num_columns >= 4 else (2 if num_columns >= 2 else 2))
         )
-    )
 
     # AIE-array data movement with object fifos (chunk-sized for consistency)
     of_ins = [
@@ -327,14 +339,24 @@ def my_conv3d(
         for i in range(num_columns)
     ]
 
-    # Create TensorAccessPatterns for data movement (6D patterns for 5D tensors).
-    # Chunks match the *_tile_ty sizes computed above.
+    # Create TensorAccessPatterns for data movement.
+    # Chunks match the *_tile_ty sizes computed above (ensuring TAP transfer size
+    # == FIFO elem size acquired in core_body).
+    # Use 4D patterns [1,1,1,chunk] for the rank-2 host tensors (1, size) --
+    # exactly as in conv2d/design.py, binary_elementwise_design.py, and
+    # channeled_unary_design.py. The previous 6D lists for "5D tensors" were
+    # mismatched to the actual flattened ndarray shape passed to TAP ctor and
+    # to rt.sequence; this over-allocated input DMA channels/BDs during lowering
+    # (manifesting as "'aie.tile' op number of input DMA channel exceeded!" on
+    # tile(0,2) for conv3d_3_16_*/conv3d_16_16_* and groups=1/16 cases etc.).
+    # 4D fixes channel pressure while preserving identical linear chunking
+    # semantics for all groups/bias/variant paths.
     input_taps = [
         TensorAccessPattern(
             (1, input_size),
             input_chunk * i,
-            [1, 1, 1, 1, 1, input_chunk],
-            [0, 0, 0, 0, 0, 1],
+            [1, 1, 1, input_chunk],
+            [0, 0, 0, 1],
         )
         for i in range(num_columns)
     ]
@@ -343,8 +365,8 @@ def my_conv3d(
         TensorAccessPattern(
             (1, weight_size),
             weight_chunk * i,
-            [1, 1, 1, 1, 1, weight_chunk],
-            [0, 0, 0, 0, 0, 1],
+            [1, 1, 1, weight_chunk],
+            [0, 0, 0, 1],
         )
         for i in range(num_columns)
     ]
@@ -353,8 +375,8 @@ def my_conv3d(
         TensorAccessPattern(
             (1, output_size),
             output_chunk * i,
-            [1, 1, 1, 1, 1, output_chunk],
-            [0, 0, 0, 0, 0, 1],
+            [1, 1, 1, output_chunk],
+            [0, 0, 0, 1],
         )
         for i in range(num_columns)
     ]
