@@ -76,7 +76,10 @@ from iron.operators.avgpool.test import get_params
 # =============================================================================
 
 
-@pytest.mark.parametrize("seed", [42])
+@pytest.mark.parametrize(
+    "seed",
+    [pytest.param(42, id="seed_42")],
+)
 def test_avgpool_reference_cpu_only(seed):
     """Pure-CPU reference implementation test (no hardware, no aie_context).
 
