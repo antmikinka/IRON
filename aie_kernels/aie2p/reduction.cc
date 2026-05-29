@@ -53,7 +53,7 @@ void reduction_sum_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction_
     bfloat16 *__restrict pOut = output;
 
     // Initialize accumulator vector
-    aie::vector<bfloat16, vec_factor> acc_vec = aie::zeros<bfloat16, vec_factor>();
+    aie::accum<accfloat, vec_factor> acc_vec = aie::zeros<accfloat, vec_factor>();
 
     const int F = reduction_size / vec_factor;
 
@@ -66,7 +66,7 @@ void reduction_sum_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction_
     }
 
     // Horizontal sum of the accumulator vector
-    bfloat16 result = aie::reduce_add(acc_vec);
+    bfloat16 result = static_cast<bfloat16>(aie::reduce_add(acc_vec.template to_vector<float>()));
 
     // Handle remaining elements if reduction_size is not divisible by vec_factor
     const int remainder = reduction_size % vec_factor;
@@ -221,7 +221,7 @@ void reduction_mean_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction
     bfloat16 *__restrict pOut = output;
 
     // Initialize accumulator vector
-    aie::vector<bfloat16, vec_factor> acc_vec = aie::zeros<bfloat16, vec_factor>();
+    aie::accum<accfloat, vec_factor> acc_vec = aie::zeros<accfloat, vec_factor>();
 
     const int F = reduction_size / vec_factor;
 
@@ -234,7 +234,7 @@ void reduction_mean_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction
     }
 
     // Horizontal sum of the accumulator vector
-    bfloat16 sum = aie::reduce_add(acc_vec);
+    bfloat16 sum = static_cast<bfloat16>(aie::reduce_add(acc_vec.template to_vector<float>()));
 
     // Handle remaining elements
     const int remainder = reduction_size % vec_factor;

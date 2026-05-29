@@ -5,6 +5,7 @@
 
 from .base import (
     AIEOperatorBase,
+    AIEOperatorConstraintError,
     MLIROperator,
     CompositeOperator,
     AIERuntimeArgSpec,
@@ -16,5 +17,7 @@ from .compilation import (
     KernelArchiveArtifact,
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
+    XclbinArtifact,
+    InstsBinArtifact,
     DesignGenerator,
 )
