@@ -112,19 +112,19 @@ def my_reduction(
     output_ty = np.ndarray[(output_size,), np.dtype[dtype]]
     tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
 
-    # P2-11 FIX + chunk-size-first (cross-operator L3 hygiene, ref conv2d gold):
-    # Use per-col chunk for large-buffer test. Force depth=1 when chunk>4096
-    # elems (large buffers) to protect L2 banks on compute tiles incl. tile(0,2).
-    # Depth scaled by cols for small chunks.
-    fifodepth = (
-        4
-        if num_columns >= 8
-        else (
-            3
-            if num_columns >= 4
-            else (2 if num_columns >= 2 else (1 if chunk > 4096 else 2))
+    # Chunk-size-first fifodepth heuristic (production fix for 600s hang).
+    # Large per-col chunk (== input_size/num_columns == tile under contract)
+    # forces depth=1 to avoid L2 bank overflow and reduce modeling complexity
+    # in Program/SequentialPlacer (parity with conv gold fixes).
+    # For small chunks, scale by column count.
+    if chunk > 2048 or tile_size > 2048:
+        fifodepth = 1
+    else:
+        fifodepth = (
+            4
+            if num_columns >= 8
+            else (3 if num_columns >= 4 else (2 if num_columns >= 2 else 2))
         )
-    )
 
     # AIE-array data movement with object fifos, using explicit L3->L2->L1
     # staging (.cons().forward) for ingress (input). This relieves shim input
@@ -178,11 +178,14 @@ def my_reduction(
         for i in range(num_columns)
     ]
 
-    # Create a TensorAccessPattern for each column
-    # The pattern chops the data in equal chunks and moves them in parallel
+    # Create a TensorAccessPattern for each column (CORRECT 4D TAPs for
+    # (1, size) host tensors per gold conv3d/conv2d L3+staging fixes).
+    # 4D shape (1,1,1,S) + 4D pattern matches 1D bf16 data viewed as innermost
+    # dimension; fixes rank mismatch that caused 600s silent hang in TAP lib /
+    # Program lowering for first test case after collection header.
     taps = [
         TensorAccessPattern(
-            (1, input_size),
+            (1, 1, 1, input_size),
             chunk * i,  # Start offset for column i
             [1, 1, 1, chunk],
             [0, 0, 0, 1],
@@ -190,11 +193,11 @@ def my_reduction(
         for i in range(num_columns)
     ]
 
-    # Output taps
+    # Output taps (also 4D for consistency with ingress + gold model)
     output_chunk = output_size // num_columns
     output_taps = [
         TensorAccessPattern(
-            (1, output_size),
+            (1, 1, 1, output_size),
             output_chunk * i,  # Start offset for column i
             [1, 1, 1, output_chunk],
             [0, 0, 0, 1],

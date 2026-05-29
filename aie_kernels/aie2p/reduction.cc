@@ -4,6 +4,11 @@
 // Reduction kernel for AIE2P (NPU2)
 // Supports: sum, mean, max, min along the reduction dimension
 // AIE2P has enhanced vector capabilities compared to AIE2
+//
+// 600s hang modeling fix (this agent, feature/operator-reduction):
+// Paired with design.py L3 + 4D TAPs + chunk-depth (ref
+// /tmp/reduction_hw_long.log + conv3d commits a2d5243 + 4c15030 +
+// conv2d L3 staging agent 019e71e1-2b61...). No kernel logic change.
 
 #define NOCPP
 

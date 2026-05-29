@@ -51,6 +51,12 @@ the hardware integration surface.
 
 Black-formatted (target py314), production-hardened, iron314 collection +
 execution + CSV-hook compatibility + get_params invariants all verified.
+
+# 600s hang diagnosis reference (reduction on feature/operator-reduction):
+# This cpu_test.py remains the pure-CPU trustworthiness foundation (no XRT).
+# The hang was in NPU path (design TAP/OF modeling); fixed in sibling design.py
+# + op.py. References: /tmp/reduction_hw_long.log + conv3d gold (a2d5243 +
+# 4c15030) + conv2d L3 agent 019e71e1. Post-fix verify uses this + small NPU.
 """
 
 import pytest

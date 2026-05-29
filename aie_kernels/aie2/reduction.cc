@@ -4,6 +4,11 @@
 // Reduction kernel for AIE2 (NPU)
 // Supports: sum, max, min along the reduction dimension (mean is AIE2P-only)
 //
+// 600s hang modeling fix (this agent, feature/operator-reduction):
+// Paired with design.py L3 staging + 4D TAPs + chunk-first depth (ref
+// /tmp/reduction_hw_long.log + conv3d a2d5243/4c15030 + conv2d agent).
+// No logic change here; extern "C" closure retained for aiecc symbol res.
+//
 // AUDITOR FIX (AIE2 / AIE2P Kernel Vectorization & Accumulator Discipline):
 // - Fixed erroneous vector<bfloat16,N> accumulator in reduction_sum_bf16_vector (was
 //   using aie::add + reduce_add directly on bf16 vector, violating AccumOrOp concept
