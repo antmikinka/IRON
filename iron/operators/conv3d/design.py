@@ -422,15 +422,15 @@ def my_conv3d(
             tg = rt.task_group()
 
             for i in range(num_columns):
-                rt.fill(of_ins[i].prod(), A, input_taps[i], task_group=tg)
+                rt.fill(of_ins_l3[i].prod(), A, input_taps[i], task_group=tg)
             for i in range(num_columns):
-                rt.fill(of_weights[i].prod(), W, weight_taps[i], task_group=tg)
+                rt.fill(of_weights_l3[i].prod(), W, weight_taps[i], task_group=tg)
 
             if bias_size > 0:
                 bias_tap = TensorAccessPattern(
                     (1, bias_size), 0, [1, 1, 1, bias_size], [0, 0, 0, 1]
                 )
-                rt.fill(of_bias.prod(), B, bias_tap, task_group=tg)
+                rt.fill(of_bias_l3.prod(), B, bias_tap, task_group=tg)
 
             for i in range(num_columns):
                 rt.drain(of_outs[i].cons(), C, output_taps[i], wait=True, task_group=tg)
@@ -442,9 +442,9 @@ def my_conv3d(
             tg = rt.task_group()
 
             for i in range(num_columns):
-                rt.fill(of_ins[i].prod(), A, input_taps[i], task_group=tg)
+                rt.fill(of_ins_l3[i].prod(), A, input_taps[i], task_group=tg)
             for i in range(num_columns):
-                rt.fill(of_weights[i].prod(), W, weight_taps[i], task_group=tg)
+                rt.fill(of_weights_l3[i].prod(), W, weight_taps[i], task_group=tg)
             for i in range(num_columns):
                 rt.drain(of_outs[i].cons(), C, output_taps[i], wait=True, task_group=tg)
             rt.finish_task_group(tg)
