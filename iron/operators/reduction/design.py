@@ -8,6 +8,18 @@ Generates MLIR code for reduction operations (sum, mean, max, min)
 on AIE2 (NPU) and AIE2P (NPU2) architectures.
 """
 
+# =============================================================================
+# MODELING STATUS (post L3 staging + cross-op hygiene pass)
+# =============================================================================
+# - Ingress L3 staging: ADOPTED (gold from conv2d). of_ins now via
+#   of_ins_l3.cons().forward() so rt.fill uses L3 prod (shim DMA), cores
+#   use L1 endpoint. Prevents input DMA channel exceeded on tile(0,2).
+# - get_shim_dma_limit: imported defensively (future per-shim checks).
+# - fifodepth: now chunk-size-first (uses full per-col chunk for large buf
+#   test) + force depth=1 for large buffers. Outs remain simple drains.
+# - References diagnosing per-branch resource agents + conv2d gold edit.
+# =============================================================================
+
 from ml_dtypes import bfloat16
 from pathlib import Path
 import numpy as np
@@ -20,6 +32,14 @@ from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 from aie.helpers.util import np_ndarray_type_get_shape
+
+# For future shim DMA / per-tile channel constraint checks (parity with
+# conv2d gold, rms_norm, binary_elementwise, channeled_unary etc). L3-staged
+# ingress (see below) moves shim input DMA to memtile; compute tiles (row 2
+# e.g. tile(0,2)) only see L2L1. Still exercises allocator on some configs;
+# full get_shim_dma_limit + per-shim modeling + num_channels refactor is the
+# next modeling step (coordinate with cross-operator DMA fixer).
+from iron.common.utils import get_shim_dma_limit
 
 
 def my_reduction(
@@ -71,21 +91,34 @@ def my_reduction(
     output_ty = np.ndarray[(output_size,), np.dtype[dtype]]
     tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
 
-    # P2-11 FIX: Explicit ObjectFifo depth calculation for Reduction stability (parity with Conv3D)
-    # Depth=4 for 8+ columns, depth=3 for 4+ columns, depth=2 for 2 columns, depth=1 for large tiles
+    # P2-11 FIX + chunk-size-first (cross-operator L3 hygiene, ref conv2d gold):
+    # Use per-col chunk for large-buffer test. Force depth=1 when chunk>4096
+    # elems (large buffers) to protect L2 banks on compute tiles incl. tile(0,2).
+    # Depth scaled by cols for small chunks.
     fifodepth = (
         4
         if num_columns >= 8
         else (
             3
             if num_columns >= 4
-            else (2 if num_columns >= 2 else (1 if tile_size > 4096 else 2))
+            else (2 if num_columns >= 2 else (1 if chunk > 4096 else 2))
         )
     )
 
-    # AIE-array data movement with object fifos (chunk-sized for consistency)
+    # AIE-array data movement with object fifos, using explicit L3->L2->L1
+    # staging (.cons().forward) for ingress (input). This relieves shim input
+    # DMA channel pressure on compute tiles (e.g. tile(0,2) "number of input
+    # DMA channel exceeded"). L3 endpoint for rt.fill prod; L1 for core acquire.
+    # Outs (drains) kept simple (output DMA direction).
+    of_ins_l3 = [
+        ObjectFifo(tile_ty, name=f"in_l3_{i}", depth=fifodepth)
+        for i in range(num_columns)
+    ]
     of_ins = [
-        ObjectFifo(tile_ty, name=f"in_{i}", depth=fifodepth) for i in range(num_columns)
+        of_ins_l3[i]
+        .cons()
+        .forward(obj_type=tile_ty, name=f"in_l1_{i}", depth=fifodepth)
+        for i in range(num_columns)
     ]
     of_outs = [
         ObjectFifo(tile_ty, name=f"out_{i}", depth=fifodepth)
@@ -156,10 +189,11 @@ def my_reduction(
         # Initialize a group for parallel drain tasks
         tg = rt.task_group()
 
-        # Fill the input objectFIFOs with data
+        # Fill the input objectFIFOs with data (use L3 endpoint for shim DMA;
+        # the .cons().forward L1 endpoint is what cores acquire from).
         for i in range(num_columns):
             rt.fill(
-                of_ins[i].prod(),
+                of_ins_l3[i].prod(),
                 A,
                 taps[i],
                 task_group=tg,

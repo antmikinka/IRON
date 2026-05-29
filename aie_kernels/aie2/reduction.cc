@@ -3,6 +3,21 @@
 
 // Reduction kernel for AIE2 (NPU)
 // Supports: sum, max, min along the reduction dimension (mean is AIE2P-only)
+//
+// AUDITOR FIX (AIE2 / AIE2P Kernel Vectorization & Accumulator Discipline):
+// - Fixed erroneous vector<bfloat16,N> accumulator in reduction_sum_bf16_vector (was
+//   using aie::add + reduce_add directly on bf16 vector, violating AccumOrOp concept
+//   for mac/reduce_add paths; same class of bug fixed on conv2d/conv3d).
+// - Now uses aie::accum<accfloat,16> + mac idiom + to_vector<float> + reduce_add on float
+//   (exact pattern from post-fix conv* aie2/aie2p kernels that enabled 600s NPU runs).
+// - event0()/event1() remain only on hot vectorized path (scalars untouched).
+// - extern "C" and reduction_*_bf16_vector signatures match Kernel() decls in
+//   iron/operators/reduction/design.py exactly.
+// References: 600s logs (/tmp/reduction_hw_long.log etc from iron314 runs on
+// feature/operator-reduction), design resource agents (SPEC-011, design.py my_reduction),
+// conv3d/conv2d auditor fixes in their worktrees.
+//
+// Cross-audit with aie2p/reduction.cc (which already used accum for sum/mean).
 
 #define NOCPP
 
@@ -35,7 +50,7 @@ void reduction_sum_bf16_scalar(bfloat16 *input, bfloat16 *output, int reduction_
 
 /**
  * Reduction Sum Kernel - Vectorized version for AIE2
- * Uses vector load and reduce operations
+ * Uses vector load and proper accum<accfloat> discipline (AUDITOR FIX)
  *
  * @param input - Input tensor [reduction_dim]
  * @param output - Output scalar (sum of all elements)
@@ -43,15 +58,16 @@ void reduction_sum_bf16_scalar(bfloat16 *input, bfloat16 *output, int reduction_
  */
 void reduction_sum_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction_size)
 {
-    constexpr int vec_factor = 16; // Process 16 elements per vector operation
+    constexpr int vec_factor = 16; // Standardized to 16 for AIE2 vector/accum compatibility (matches aie2p/conv patterns)
 
     event0();
 
     bfloat16 *__restrict pIn = input;
     bfloat16 *__restrict pOut = output;
 
-    // Initialize accumulator
-    aie::vector<bfloat16, vec_factor> acc_vec = aie::zeros<bfloat16, vec_factor>();
+    // Initialize accumulator using from_vector + accfloat (AUDITOR: fixes AccumOrOp failures on add/reduce_add)
+    aie::accum<accfloat, vec_factor> acc_vec;
+    acc_vec.from_vector(aie::zeros<float, vec_factor>(), 0);
 
     const int F = reduction_size / vec_factor;
 
@@ -60,19 +76,22 @@ void reduction_sum_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction_
     for (int i = 0; i < F; i++) {
         aie::vector<bfloat16, vec_factor> in_vec = aie::load_v<vec_factor>(pIn);
         pIn += vec_factor;
-        acc_vec = aie::add(acc_vec, in_vec);
+        // Use mac with ones vector for sum (mulacc-by-1 idiom) - addresses bf16 accumulation compatibility
+        auto ones = aie::broadcast<bfloat16, vec_factor>(bfloat16(1.0f));
+        acc_vec = aie::mac(acc_vec, in_vec, ones);
     }
 
-    // Horizontal sum of the accumulator vector
-    bfloat16 result = aie::reduce_add(acc_vec);
+    // Horizontal sum using reduce_add on float vector (standard post-fix pattern)
+    aie::vector<float, vec_factor> red = acc_vec.to_vector<float>();
+    float sum_f = aie::reduce_add(red);
 
-    // Handle remaining elements if reduction_size is not divisible by vec_factor
+    // Handle remaining elements (accumulate in float for precision)
     const int remainder = reduction_size % vec_factor;
     for (int i = 0; i < remainder; i++) {
-        result += pIn[i];
+        sum_f += static_cast<float>(pIn[i]);
     }
 
-    pOut[0] = result;
+    pOut[0] = static_cast<bfloat16>(sum_f);
 
     event1();
 }
@@ -111,11 +130,10 @@ void reduction_max_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction_
     bfloat16 *__restrict pIn = input;
     bfloat16 *__restrict pOut = output;
 
-    // Initialize with first element
-    bfloat16 max_val = pIn[0];
-    pIn++;
+    // Vectorized max using AIE native ops (no scalar inner loop for fast clean compile on AIE2/AIE2P)
+    aie::vector<bfloat16, vec_factor> max_v = aie::broadcast<bfloat16, vec_factor>(bfloat16(-3.4028235e+38f));
 
-    const int F = (reduction_size - 1) / vec_factor;
+    const int F = reduction_size / vec_factor;
 
     AIE_PREPARE_FOR_PIPELINING
     AIE_LOOP_MIN_ITERATION_COUNT(16)
@@ -123,19 +141,19 @@ void reduction_max_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction_
         aie::vector<bfloat16, vec_factor> in_vec = aie::load_v<vec_factor>(pIn);
         pIn += vec_factor;
 
-        // Vector max reduction
-        for (int j = 0; j < vec_factor; j++) {
-            max_val = (in_vec[j] > max_val) ? in_vec[j] : max_val;
-        }
+        max_v = aie::max(max_v, in_vec);
     }
+
+    bfloat16 result = aie::reduce_max(max_v);
 
     // Handle remaining elements
-    const int remainder = (reduction_size - 1) % vec_factor;
+    const int remainder = reduction_size % vec_factor;
     for (int i = 0; i < remainder; i++) {
-        max_val = (pIn[i] > max_val) ? pIn[i] : max_val;
+        if (pIn[i] > result)
+            result = pIn[i];
     }
 
-    pOut[0] = max_val;
+    pOut[0] = result;
 
     event1();
 }
@@ -174,11 +192,10 @@ void reduction_min_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction_
     bfloat16 *__restrict pIn = input;
     bfloat16 *__restrict pOut = output;
 
-    // Initialize with first element
-    bfloat16 min_val = pIn[0];
-    pIn++;
+    // Vectorized min using AIE native ops (no scalar inner loop for fast clean compile on AIE2/AIE2P)
+    aie::vector<bfloat16, vec_factor> min_v = aie::broadcast<bfloat16, vec_factor>(bfloat16(3.4028235e+38f));
 
-    const int F = (reduction_size - 1) / vec_factor;
+    const int F = reduction_size / vec_factor;
 
     AIE_PREPARE_FOR_PIPELINING
     AIE_LOOP_MIN_ITERATION_COUNT(16)
@@ -186,19 +203,19 @@ void reduction_min_bf16_vector(bfloat16 *input, bfloat16 *output, int reduction_
         aie::vector<bfloat16, vec_factor> in_vec = aie::load_v<vec_factor>(pIn);
         pIn += vec_factor;
 
-        // Vector min reduction
-        for (int j = 0; j < vec_factor; j++) {
-            min_val = (in_vec[j] < min_val) ? in_vec[j] : min_val;
-        }
+        min_v = aie::min(min_v, in_vec);
     }
+
+    bfloat16 result = aie::reduce_min(min_v);
 
     // Handle remaining elements
-    const int remainder = (reduction_size - 1) % vec_factor;
+    const int remainder = reduction_size % vec_factor;
     for (int i = 0; i < remainder; i++) {
-        min_val = (pIn[i] < min_val) ? pIn[i] : min_val;
+        if (pIn[i] < result)
+            result = pIn[i];
     }
 
-    pOut[0] = min_val;
+    pOut[0] = result;
 
     event1();
 }
