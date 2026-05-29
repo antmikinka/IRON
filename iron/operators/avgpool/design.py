@@ -20,6 +20,8 @@ Generates MLIR for average pooling operations on AIE2 (NPU) and AIE2P (NPU2) arc
 # - Honest docs added. No misleading claims.
 # - MLIR + sequence remains valid skeleton; actual pooling compute dispatched
 #   via runlist in op.py on the linked kernels.
+# - L3 staging + get_shim import + chunk-first fifodepth: ADOPTED for ingress
+#   input (cross-op consistency, ref conv2d gold edit + diagnosing agents).
 # =============================================================================
 
 from ml_dtypes import bfloat16
@@ -33,6 +35,14 @@ from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
+
+# For future shim DMA / per-tile channel constraint checks (parity with
+# conv2d gold, rms_norm, binary_elementwise, channeled_unary etc). L3-staged
+# ingress (see below) moves shim input DMA to memtile; compute tiles (row 2
+# e.g. tile(0,2)) only see L2L1. Still exercises allocator on some configs;
+# full get_shim_dma_limit + per-shim modeling + num_channels refactor is the
+# next modeling step (coordinate with cross-operator DMA fixer).
+from iron.common.utils import get_shim_dma_limit
 
 
 def my_avg_pool2d(
@@ -98,21 +108,32 @@ def my_avg_pool2d(
         (output_chunk if output_chunk > 0 else 1,), np.dtype[dtype]
     ]
 
-    # P2-11 FIX: Explicit ObjectFifo depth calculation for AvgPool stability (parity with Conv3D)
-    # Depth=4 for 8+ columns, depth=3 for 4+ columns, depth=2 for 2 columns, depth=1 for large tiles
+    # P2-11 FIX + chunk-size-first (cross-operator L3 hygiene, ref conv2d gold):
+    # Use per-col input_chunk for large-buffer test. Force depth=1 when
+    # chunk>4096 elems (large buffers) to protect L2 banks on compute tiles
+    # (incl. tile(0,2) DMA channel pressure). Depth scaled by cols otherwise.
     fifodepth = (
         4
         if num_columns >= 8
         else (
             3
             if num_columns >= 4
-            else (2 if num_columns >= 2 else (1 if tile_size > 4096 else 2))
+            else (2 if num_columns >= 2 else (1 if input_chunk > 4096 else 2))
         )
     )
 
-    # AIE-array data movement with object fifos (chunk-sized for consistency)
+    # AIE-array data movement with object fifos, using explicit L3->L2->L1
+    # staging (.cons().forward) for ingress (input). This relieves shim input
+    # DMA channel pressure on compute tiles (e.g. tile(0,2)). L3 for rt.fill
+    # prod; L1 for core acquire. Outs kept simple (drain direction).
+    of_ins_l3 = [
+        ObjectFifo(input_tile_ty, name=f"in_l3_{i}", depth=fifodepth)
+        for i in range(num_columns)
+    ]
     of_ins = [
-        ObjectFifo(input_tile_ty, name=f"in_{i}", depth=fifodepth)
+        of_ins_l3[i].cons().forward(
+            obj_type=input_tile_ty, name=f"in_l1_{i}", depth=fifodepth
+        )
         for i in range(num_columns)
     ]
     of_outs = [
@@ -216,10 +237,10 @@ def my_avg_pool2d(
         # Initialize a group for parallel tasks
         tg = rt.task_group()
 
-        # Fill input objectFIFOs
+        # Fill input objectFIFOs (L3 endpoint for shim DMA staging; L1 for cores)
         for i in range(num_columns):
             rt.fill(
-                of_ins[i].prod(),
+                of_ins_l3[i].prod(),
                 A,
                 input_taps[i],
                 task_group=tg,
