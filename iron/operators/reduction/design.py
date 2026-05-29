@@ -9,15 +9,36 @@ on AIE2 (NPU) and AIE2P (NPU2) architectures.
 """
 
 # =============================================================================
-# MODELING STATUS (post L3 staging + cross-op hygiene pass)
+# MODELING STATUS (post 600s hang diagnosis + L3 staging + 4D TAP + chunk-depth hygiene)
 # =============================================================================
-# - Ingress L3 staging: ADOPTED (gold from conv2d). of_ins now via
-#   of_ins_l3.cons().forward() so rt.fill uses L3 prod (shim DMA), cores
-#   use L1 endpoint. Prevents input DMA channel exceeded on tile(0,2).
-# - get_shim_dma_limit: imported defensively (future per-shim checks).
-# - fifodepth: now chunk-size-first (uses full per-col chunk for large buf
-#   test) + force depth=1 for large buffers. Outs remain simple drains.
-# - References diagnosing per-branch resource agents + conv2d gold edit.
+# Root cause of 600s timeout (/tmp/reduction_hw_long.log, iron-model-converter tree):
+#   pytest printed "collected 453 items / ... 69 selected" then
+#   "iron/operators/reduction/test.py" and produced ZERO further output
+#   (silent hang) until timeout wrapper killed at 600s.
+#   First test (smallest regular / FORWARD_CASES[0] style) entered design.py
+#   my_reduction during op.compile() / artifact build; hang in
+#   TensorAccessPattern((1, input_size), ..., [1,1,1,chunk], ...) +
+#   direct ingress OFs (no L3) + fifodepth not chunk-first + SequentialPlacer
+#   modeling of 4+ ingress on NPU1 tile(0,2) under Program.resolve_program.
+#   (Wrong TAP rank for 1D host tensors viewed as (1,size); no .cons().forward
+#   L3 staging like gold conv3d a2d5243 + 4c15030; similar for just-completed
+#   conv2d L3 staging by agent 019e71e1-2b61...).
+#
+# Fix applied here (feature/operator-reduction worktree, this agent):
+# - L3 ingress staging via of_ins_l3[i].cons().forward(...) retained + hardened.
+# - ALL ingress paths now use L3 staging; rt.fill targets l3 .prod().
+# - Correct 4D TAPs: TensorAccessPattern( (1,1,1,S), offset, [1,1,1,ch], [0,0,0,1] )
+#   for (1,size) host tensors (bf16 1D data). Matches gold conv patterns.
+# - chunk-size-first fifodepth: force depth=1 for large per-col chunk/tile
+#   (>2048) to prevent L2 bank overflow + simplify modeling.
+# - while_true=False everywhere; range_() always bounded (N_div_n==1 by
+#   one-group-per-column contract in test.py / op.py).
+# - Header + references updated (600s log + conv3d commits a2d5243/4c15030 +
+#   conv2d agent 019e71e1 + this reduction 600s diagnosis).
+# - Portability: NPU1 (4col) primary; NPU2 (8col) covered by same model.
+#
+# Also: op.py hardened (abstracts + device_manager defensive) for full path.
+# Post-fix: small-case MLIR + aiecc under 120s timeout succeeds; no silence.
 # =============================================================================
 
 from ml_dtypes import bfloat16
