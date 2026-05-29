@@ -11,8 +11,53 @@ import torch
 import numpy as np
 from typing import Literal
 
-from iron.common.utils import torch_to_numpy, numpy_to_torch
+# Inlined bf16 view helpers (production self-containment for cpu_test.py
+# on feature/operator-reduction branch; matches iron.common.utils semantics
+# exactly, zero-copy uint16 reinterpret for bf16 <-> numpy). Enables the
+# _emulate_bf16_reduction path (post accum<accfloat> AIE kernel fidelity)
+# without external common/ dependency during iron314 CPU validation.
+def torch_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    # Detach (to drop grad) and ensure on CPU
+    t = tensor.detach()
+    if t.device.type != "cpu":
+        t = t.cpu()
+    # Ensure contiguous for safe view operations
+    if not t.is_contiguous():
+        t = t.contiguous()
+
+    if t.dtype == torch.bfloat16:
+        # View the same memory as uint16, then as NumPy bfloat16
+        # This avoids numeric conversion and extra passes over memory.
+        u16_np = t.view(torch.uint16).numpy()  # shares memory
+        return u16_np.view(np.dtype("bfloat16"))  # reinterpret
+
+    return t.numpy()
+
+
+def numpy_to_torch(array: np.ndarray) -> torch.Tensor:
+    # Ensure contiguous to let from_numpy create a view
+    if not array.flags["C_CONTIGUOUS"]:
+        array = np.ascontiguousarray(array)
+
+    if array.dtype == np.dtype("bfloat16"):
+        # reinterpret the same memory as uint16, then view as torch.bfloat16
+        t_u16 = torch.from_numpy(array.view(np.uint16))
+        return t_u16.view(torch.bfloat16)  # view
+
+    return torch.from_numpy(array)
+
+
 from ml_dtypes import bfloat16 as bfloat16_np
+
+# Inlined torch_dtype_map (production self-containment; matches common/utils)
+torch_dtype_map = {
+    "bf16": torch.bfloat16,
+    "f32": torch.float32,
+    "i8": torch.int8,
+    "ui8": torch.uint8,
+    "i16": torch.int16,
+    "i32": torch.int32,
+}
 
 ReductionOp = Literal["sum", "mean", "max", "min"]
 
@@ -162,8 +207,7 @@ def generate_golden_reference(
     Returns:
         Dictionary with input tensor and expected output (faithful to AIE)
     """
-    from iron.common.utils import torch_dtype_map
-
+    # Use inlined module-level torch_dtype_map (no external common dep)
     torch.manual_seed(seed)
 
     if isinstance(dtype, str):
